@@ -2,90 +2,70 @@
 
 const util = require('./util')
 const {DataFrame} = require('./dataframe')
+const {Expr} = require('./expr')
+const {Stage} = require('./stage')
 const {Environment} = require('./environment')
 const {Program} = require('./program')
 const {JsonToObj} = require('./json2obj')
-const {HtmlFactory} = require('./html')
+const {JsonToHtml} = require('./json2html')
 
 /**
- * Browser-based interface.
+ * Generic user interface.
  */
 class UserInterface {
   /**
-   * Set up after DOM is loaded: create singleton and show default tab.
+   * Build instance.
+   * @param {object} document The DOM document.
+   * @param {function} howToGetData How to read datasets.
    */
-  static Setup () {
-    UserInterface.instance = new UserInterface()
-    return UserInterface.instance
-  }
-
-  /**
-   * Get a named dataset (provided as callback to runtime environment objects).
-   * @param {string} name Name of previously-loaded data set.
-   * @returns Tabular data to be converted to dataframe.
-   */
-  static GetData (name) {
-    util.check(UserInterface.instance,
-               `UserInterface instance not defined`)
-    util.check(name && (typeof name === 'string'),
-               `Require non-empty string as dataset name`)
-    util.check(UserInterface.instance.data.has(name),
-               `Cannot get unknown dataset ${name}`)
-    return UserInterface.instance.data.get(name).data
-  }
-
-  // ----------------------------------------------------------------------
-  // Build singleton instance.
-  // ----------------------------------------------------------------------
-
-  /**
-   * @param {object} util Utilities.
-   */
-  constructor () {
-    Environment.HowToGetData = UserInterface.GetData
-    this.env = new Environment()
+  constructor (document, howToGetData, howToShowPlot) {
+    this.howToGetData = howToGetData
+    this.howToShowPlot = howToShowPlot
+    this.document = document
+    this.env = new Environment(this.howToGetData)
     this.data = new Map()
     this.program = null
     this.redisplay()
   }
 
   // ----------------------------------------------------------------------
-  // Buttons and tabs.
+  // Handling events.
   // ----------------------------------------------------------------------
 
-  /**
-   * Show the specified tab.
-   * @param {event} evt Browser event.
-   * @param {string} tabName Name of the tab (must match an id in the page).
-   * @param {string} selector Select dataset to display (or null).
-   */
-  showTab (evt, tabName, selector = null) {
-    const chosenButton = evt.target
+  showTab (chosenButton, tabName, selector) {
     const buttonGroup = chosenButton.getAttribute('data-briq-buttongroup')
     if (buttonGroup) {
-      const buttons = document.querySelectorAll(`[data-briq-buttongroup=${buttonGroup}]`)
+      const buttons = this.document.querySelectorAll(`[data-briq-buttongroup=${buttonGroup}]`)
       Array.from(buttons)
         .forEach(button => {button.classList.remove('active')})
     }
     chosenButton.classList.add('active')
 
-    const chosenTab = document.getElementById(tabName)
-    const tabParent = chosenTab.parentNode
-    Array.from(tabParent.getElementsByClassName('tabContent'))
-      .forEach(tab => {tab.style.display = 'none'})
+    const chosenTab = this.document.getElementById(tabName)
+    const tabGroup = chosenTab.getAttribute('data-briq-tabgroup')
+    if (tabGroup) {
+      const tabs = this.document.querySelectorAll(`[data-briq-tabgroup=${tabGroup}]`)
+      Array.from(tabs)
+        .forEach(tab => tab.style.display = 'none')
+    }
     chosenTab.style.display = 'block'
 
     if (selector) {
-      this.displayTable(selector)
+      this.displayTable(selector, null)
     }
   }
 
-  /**
-   * Trigger an input element when a button is clicked.
-   * @param {string} id ID of element to trigger.
-   */
-  triggerInput (id) {
-    document.getElementById(id).click()
+  loadData (name, text) {
+    const data = util.csvToTable(text)
+    const df = new DataFrame(data)
+    this.data.set(name, df)
+    this.displayTable('data', name)
+  }
+
+  loadProgram(name, text) {
+    const json = JSON.parse(text)
+    this.program = (new JsonToObj()).program(json)
+    this.displayProgram(json)
   }
 
   // ----------------------------------------------------------------------
@@ -98,20 +78,15 @@ class UserInterface {
   redisplay () {
     this.displayToolbox()
     this.displayProgram(null)
-    this.displayTable('data')
-    this.displayTable('results')
+    this.displayTable('data', null)
+    this.displayTable('results', null)
     this.displayPlot(null)
     this.displayStatistics(null, null)
     this.displayLog(null)
     this.displayError(null)
   }
 
-  /**
-   * Display a named data table as an HTML table.
-   * @param {string} which Which table to display.
-   * @param {string} name Name of dataset to select.
-   */
-  displayTable (which, name = null) {
+  displayTable (which, name) {
     const [selectorId, areaId, available] = {
       data: ['dataSelect', 'dataArea', this.data],
       results: ['resultsSelect', 'resultsArea', this.env.results]
@@ -120,8 +95,8 @@ class UserInterface {
                `Unknown name ${name}`)
 
     // Elements.
-    const selector = document.getElementById(selectorId)
-    const area = document.getElementById(areaId)
+    const selector = this.document.getElementById(selectorId)
+    const area = this.document.getElementById(areaId)
 
     // Nothing to select.
     if (available.size === 0) {
@@ -139,7 +114,7 @@ class UserInterface {
       .join('')
 
     // Display the selected dataset.
-    const table = this.dataFrameToHTML(available.get(desired))
+    const table = this.dataFrameToHTML(desired, available.get(desired))
     area.innerHTML = table
   }
 
@@ -153,7 +128,7 @@ class UserInterface {
     }
     else {
       spec = Object.assign({}, spec, UserInterface.FULL_PLOT_SIZE)
-      vegaEmbed('#plotArea', spec, {})
+      this.howToShowPlot(spec)
     }
   }
 
@@ -199,97 +174,38 @@ class UserInterface {
       ['stage', 'transformTab']
     ]
     for (const [label, id] of allTabs) {
-      const toolbox = HtmlFactory.Toolbox(label)
-      const div = document.getElementById(id)
+      const toolbox = this.makeToolbox(label)
+      const div = this.document.getElementById(id)
       div.innerHTML = toolbox
     }
   }
 
   /**
    * Display a program's structure.
-   * @param {Object} program Program to display.
+   * @param {Object} json JSON representation of program to display.
    */
-  displayProgram (program) {
-    if (program) {
-      this.displayLog([`<pre>${JSON.stringify(program.toJSON(), null, 1)}</pre>`])
-      program = program.toHTML(this.factory)
+  displayProgram (json) {
+    if (json) {
+      this.displayLog([`<pre>${JSON.stringify(json, null, 1)}</pre>`])
+      const factory = new JsonToHtml()
+      this.displayInArea('programArea', factory.program(json))
     }
     else {
       this.displayLog(['clear program'])
-      program = HtmlFactory.EmptyProgram()
+      this.displayInArea('programArea', this.makeEmptyProgram())
     }
-    this.displayInArea('programArea', program)
-  }
-
-  // ----------------------------------------------------------------------
-  // Data management.
-  // ----------------------------------------------------------------------
-
-  /**
-   * Load a CSV data file.
-   * @param {FileList} fileList List of files provided by browser file selection dialog.
-   */
-  loadData (fileList) {
-    const file = fileList[0]
-    const name = file.name
-    file.text().then(text => {
-      const data = util.csvToTable(text)
-      const df = new DataFrame(data)
-      this.data.set(name, df)
-      this.displayTable('data', name)
-    })
-  }
-
-  /**
-   * Save the current results to disk.
-   * @param {event} evt Browser event (ignored).
-   */
-  saveResults (evt) {
-    const filename = 'result.csv' // FIXME how to trigger dialog to ask for filename?
-    const text = 'a,b,c' // FIXME get the current result
-    this.saveFile(filename, text)
   }
 
   // ----------------------------------------------------------------------
   // Program management.
   // ----------------------------------------------------------------------
 
-  /**
-   * Load a program from disk.
-   * @param {FileList} fileList List of files provided by browser file selection dialog.
-   */
-  loadProgram (fileList) {
-    if (fileList.length === 0) {
-      return
-    }
-    const file = fileList[0]
-    const name = file.name
-    file.text().then(text => {
-      const json = JSON.parse(text)
-      this.program = (new JsonToObj()).program(json)
-      this.displayProgram(this.program)
-    })
-  }
-
-  /**
-   * Save a program to disk.
-   * @param {event} evt Browser event (ignored).
-   */
-  saveProgram (evt) {
-    const filename = 'program.briq' // FIXME how to trigger dialog to ask for filename?
-    const text = 'saved program' // FIXME get the actual JSON
-    this.saveFile(filename, text)
-  }
-
-  /**
-   * Run the current program.
-   */
   runProgram () {
     if (this.program === null) {
       this.displayError([`No program available`])
       return
     }
-    this.env = new Environment(UserInterface.GetData)
+    this.env = new Environment(this.howToGetData)
     this.program.run(this.env)
     this.displayLog(this.env.log)
     this.displayError(this.env.errors)
@@ -305,10 +221,10 @@ class UserInterface {
     util.check(width > 1,
                `Must have some columns in order to add a row`)
     const content = [
-      HtmlFactory.PipelineIDCell(height),
-      ...Array(width-1).fill(HtmlFactory.Placeholder()).join('')
+      this.makeIDCell(height),
+      ...Array(width-1).fill(this.makePlaceholder()).join('')
     ].join('')
-    const newRow = document.createElement('tr')
+    const newRow = this.document.createElement('tr')
     newRow.innerHTML = content
     body.appendChild(newRow)
   }
@@ -318,10 +234,10 @@ class UserInterface {
    */
   addProgramCol () {
     const body = this.getProgramBody()
-    const temp = document.createElement('tr')
+    const temp = this.document.createElement('tr')
     const children = Array.from(body.children)
     children.forEach(row => {
-      temp.innerHTML = HtmlFactory.Placeholder()
+      temp.innerHTML = this.makePlaceholder()
       row.appendChild(temp.firstChild)
     })
   }
@@ -330,7 +246,7 @@ class UserInterface {
    * Get body of program table.
    */
   getProgramBody () {
-    const table = document.getElementById('briq-program')
+    const table = this.document.getElementById('briq-program')
     if ((table === null) || (table.tagName.toUpperCase() != 'TABLE')) {
       throw new Error('cannot find valid program')
     }
@@ -351,7 +267,7 @@ class UserInterface {
    * @param {string} html What to display.
    */
   displayInArea (id, html) {
-    const div = document.getElementById(id)
+    const div = this.document.getElementById(id)
     div.innerHTML = html ? html : ''
   }
 
@@ -359,7 +275,7 @@ class UserInterface {
    * Convert dataframe to HTML.
    * @param {DataFrame} df Dataframe to display.
    */
-  dataFrameToHTML (df) {
+  dataFrameToHTML (name, df) {
     if (!df) {
       return '-empty-'
     }
@@ -367,7 +283,7 @@ class UserInterface {
     const keys = Array.from(Object.keys(data[0]))
     const header = '<tr>' + keys.map(k => `<th>${k}</th>`).join('') + '</tr>'
     const body = data.map(row => '<tr>' + keys.map(k => `<td>${row[k]}</td>`).join('') + '</tr>').join('')
-    const html = `<table class="data">${header}${body}</table>`
+    const html = `<table class="data" briq-data-tablename="${name}">${header}${body}</table>`
     return html
   }
 
@@ -386,10 +302,10 @@ class UserInterface {
         value = ''
       }
       else if (Array.isArray(value)) {
-        value = value.map(x => x.toPrecision(this.PRECISION)).join(',<br/>')
+        value = value.map(x => x.toPrecision(UserInterface.PRECISION)).join(',<br/>')
       }
       else if (typeof value === 'number') {
-        value = value.toPrecision(this.PRECISION)
+        value = value.toPrecision(UserInterface.PRECISION)
       }
       return `<tr><td>${key}</td><td>${value}</td><td>${legend[key]}</td></tr>`
     }).join('')
@@ -407,18 +323,51 @@ class UserInterface {
   }
 
   /**
-   * Save a file locally.
-   * @param {string} filename Name of file to save to.
-   * @param {whatever} content Data to save.
+   * Create a toolbox of draggables.
    */
-  saveFile (filename, content) {
-    const element = document.createElement('a')
-    element.setAttribute('href', 'data:text/plaincharset=utf-8,' + encodeURIComponent(content))
-    element.setAttribute('download', filename)
-    element.style.display = 'none'
-    document.body.appendChild(element)
-    element.click()
-    document.body.removeChild(element)
+  makeToolbox (label) {
+    const factory = new JsonToHtml()
+    let contents = null
+    if (label === 'expr') {
+      contents = Expr
+        .makeBlanks()
+        .map(expr => factory.expr(expr))
+    }
+    else if (label === 'stage') {
+      contents = Stage
+        .makeBlanks()
+        .map(expr => factory.stage(expr))
+    }
+    else {
+      util.fail(`Unknown toolbox label ${label}`)
+    }
+    contents = contents
+      .map(html => `<tr>${html}</tr>`)
+      .join('')
+    return `<table class="briq-toolbox"><tbody>${contents}</tbody></table>`
+  }
+
+  /**
+   * Create an empty program as a placeholder.
+   */
+  makeEmptyProgram () {
+    const content = `${this.makeIDCell(0)}${this.makePlaceholder()}`
+    const table = `<table id="briq-program"><tbody><tr>${content}</tr></tbody></table>`
+    return table
+  }
+
+  /**
+   * Build a table cell that can be filled in.
+   */
+  makePlaceholder () {
+    return `<td class="briq-placeholder"></td>`
+  }
+
+  /**
+   * Create a pipeline ID cell.
+   */
+  makeIDCell (i) {
+    return `<th class="redips-mark">${i}</th>`
   }
 }
 
